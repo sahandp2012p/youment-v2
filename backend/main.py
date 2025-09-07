@@ -1,10 +1,13 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
 import whisper
 import os
 import tempfile
+import json
+import time
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -31,49 +34,64 @@ class VideoRequest(BaseModel):
     url: str
 
 
-@app.post("/analyze_video")
-def analyze_video(req: VideoRequest):
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # yt-dlp options
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": os.path.join(tmpdir, "audio"),  # no extension!
-            "postprocessors": [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }
-            ],
-            "quiet": True,
-        }
-
-        # Download audio
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([req.url])
-
-        # Whisper path (FFmpegExtractAudio added .mp3)
-        audio_path = os.path.join(tmpdir, "audio.mp3")
-
-        if not os.path.exists(audio_path):
-            return {"error": "Audio file was not created. Check yt-dlp & FFmpeg setup."}
-
-        # Transcribe audio
-        result = whisper_model.transcribe(audio_path)
-        transcript = result["text"]
-
-    # Ask GPT to rate video content
-    prompt = f"""
-    You are an expert video content analyst.
-    Rate the following transcript from 1 to 10 based on its content quality, engagement, and informativeness.
-    Respond in JSON with the fields: content_score, explanation.
-
-    Transcript:
-    {transcript}
+@app.get("/analyze_stream")
+def analyze_stream(url: str):
+    """
+    SSE endpoint for real-time progress updates.
+    Frontend connects via EventSource("/analyze_stream?url=...")
     """
 
-    gpt_resp = client.chat.completions.create(
-        model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}]
-    )
+    def event_generator():
+        with tempfile.TemporaryDirectory() as tmpdir:
+            try:
+                # Step 1: Download audio
+                yield f"data: {json.dumps({'step': 'Downloading audio from YouTube...'})}\n\n"
+                ydl_opts = {
+                    "format": "bestaudio/best",
+                    "outtmpl": os.path.join(tmpdir, "audio"),
+                    "postprocessors": [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192",
+                        }
+                    ],
+                    "quiet": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
 
-    return {"transcript": transcript, "rating": gpt_resp.choices[0].message.content}
+                audio_path = os.path.join(tmpdir, "audio.mp3")
+                if not os.path.exists(audio_path):
+                    yield f"data: {json.dumps({'error': 'Audio file was not created'})}\n\n"
+                    return
+
+                # Step 2: Transcribe with Whisper
+                yield f"data: {json.dumps({'step': 'Transcribing audio with Whisper...'})}\n\n"
+                result = whisper_model.transcribe(audio_path)
+                transcript = result["text"]
+
+                # Step 3: Analyze with GPT
+                yield f"data: {json.dumps({'step': 'Analyzing transcript with GPT...'})}\n\n"
+                prompt = f"""
+                You are an expert video content analyst.
+                Rate the following transcript from 1 to 10 based on its content quality, engagement, and informativeness.
+                Respond in JSON with the fields: content_score, explanation.
+
+                Transcript:
+                {transcript}
+                """
+
+                gpt_resp = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                rating = gpt_resp.choices[0].message.content
+
+                # Step 4: Done
+                yield f"data: {json.dumps({'done': True, 'result': {'transcript': transcript, 'rating': rating}})}\n\n"
+
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
